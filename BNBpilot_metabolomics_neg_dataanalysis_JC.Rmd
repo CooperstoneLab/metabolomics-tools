@@ -1,0 +1,889 @@
+---
+title: "Metabolomic first pass analysis"
+author: "The Cooperstone lab"
+date: "Lots of times"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_download: true
+---
+
+The code below has been written by Emma Bilbrey, JL Hartman, Jenna Miller, Daniel Quiroz Moreno, Maria Sholola, and Jessica Cooperstone, and its purpose is to take deconvoluted and filtered (i.e., for CV in QCs, and removing features present in the blanks), and conduct a first pass metabolomics analysis.
+
+### Load libraries
+```{r, message = FALSE, warning = FALSE}
+library(factoextra) # visualizing PCA results
+library(glue) # for easy pasting
+library(plotly) # quick interactive plots
+library(proxyC) # more efficient large matrices
+library(data.table) # easy transposing
+library(janitor) # for cleaning names and checking duplicates
+library(notame) # for collapsing ions coming from the same metabolite
+library(doParallel) # for parallelizing notame specifically
+library(patchwork) # for making multi-panel plots
+library(rstatix) # for additional univariate functionality
+
+# this is at the end hoping that the default select will be that from dplyr
+library(tidyverse) # for everything
+```
+
+## Read in data
+
+We are reading data collected by JL Hartman of full scan high resolution MS based metabolomics data in ESI negative mode, with reversed phase/C18 chromatography. This input file is the output of the previous filtering step.  We are also reading in some meta-data.
+```{r}
+# read in metabolomics data
+metab <- read_csv("data/BNB_neg_filtered_template.csv",
+                  trim_ws = TRUE)
+
+# read in meta data
+metadata <- read_csv("data/BNBpilot_metadata.csv",
+                     trim_ws = TRUE)
+```
+
+Take a quick look at our data.
+
+```{r}
+# look at first 5 rows, first 5 columns 
+metab[1:5,1:5]
+
+# look at first 5 rows, all columns 
+metadata[1:5,]
+
+# check dimensions
+dim(metab)
+dim(metadata)
+```
+
+## Wrangle sample names
+
+Here, the samples are in columns and the features are in rows. Samples are coded so that the first number is the plot code, the second number is what QC batch is that a sample a part of, and the third number is the overall run over. We want to separate this information.
+```{r}
+samples <- as.data.frame(colnames(metab)) %>%
+  filter(!`colnames(metab)` == "mz_rt") %>%
+  separate_wider_delim(cols = `colnames(metab)`,
+                       delim = "_",
+                       names = c("plot", "qc_batch", "run_order"),
+                       cols_remove = FALSE) %>%
+  rename(sample = `colnames(metab)`)
+
+head(samples)
+```
+
+Combining data about QC batch and run order into meta-data file.
+```{r}
+metadata_plus <- left_join(samples, metadata, by = "plot")
+```
+
+Making a new column that will indicate whether a sample is a "sample" or a "QC"
+```{r}
+metadata_plus <- metadata_plus %>%
+  mutate(sample_or_qc = if_else(str_detect(plot, "QC"), true = "QC", false = "Sample")) %>%
+  dplyr::select(plot, sample, everything()) # and move Sample to the front
+```
+
+Change sample names to just be plot.
+```{r}
+# save as a new df called metab_renamed
+metab_renamed <- metab 
+
+# add mz_rt to be the first item in samples$plot
+to_rename <- c("mz_rt", samples$plot)
+
+# rename all columns
+colnames(metab_renamed) <- to_rename
+```
+
+Go from wide to long data.
+```{r}
+metab_long <- metab %>%
+  mutate(across(.cols = 2:ncol(.), .fns = as.numeric)) %>% # convert intensity to numeric
+  pivot_longer(cols = -mz_rt, # all but mz_rt
+               names_to = "sample",
+               values_to = "rel_abund")
+
+glimpse(metab_long)
+```
+
+Add meta-data.
+```{r}
+metab_long_meta <- left_join(metab_long, metadata_plus, by = "sample")
+```
+
+Also add separate columns for mz and rt, and making both numeric.
+```{r}
+metab_long_meta <- metab_long_meta %>%
+  separate_wider_delim(cols = mz_rt,
+                       delim = "_",
+                       names = c("mz", "rt"),
+                       cols_remove = FALSE) %>%
+  mutate(across(.cols = 1:2, .fns = as.numeric))  %>% # convert mz and rt to numeric
+  drop_na(mz, rt) # maybe not actually necessary
+
+# how did that go?
+head(metab_long_meta)
+```
+
+
+## Data summaries
+What mass range do I have?
+```{r}
+range(metab_long_meta$mz)
+```
+
+What retention time range do I have?
+```{r}
+range(metab_long_meta$rt)
+```
+
+How many samples are in each of my meta-data groups?
+```{r}
+# make wide data to make some calculations easier
+metab_wide_meta <- metab_long_meta %>%
+  dplyr::select(-mz, -rt) %>%
+  pivot_wider(names_from = mz_rt,
+              values_from = rel_abund)
+
+# by sample vs QC
+metab_wide_meta %>%
+  count(sample)
+
+# by species
+# NAs are the QCs
+metab_wide_meta %>%
+  count(species)
+```
+
+What does my data coverage across mz and rt look like?
+```{r}
+metab_long_meta %>%
+  group_by(mz_rt) %>% # so we only have one point per feature
+  ggplot(aes(x = rt, y = mz)) +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Retention time (min)",
+       y = "Mass to charge ratio (m/z)",
+       title = "m/z by retention time plot (all features)",
+       subtitle = "C18 reversed phase, negative ionization mode")
+```
+
+Distribution of masses
+```{r}
+metab_long_meta %>%
+  group_by(mz_rt) %>%
+  ggplot(aes(x = mz)) +
+  geom_histogram(bins = 100) +
+  theme_minimal() +
+  labs(x = "m/z",
+       y = "Number of features",
+       title = "Distribution of features by mass")
+```
+
+Distribution of retention times
+```{r}
+metab_long_meta %>%
+  group_by(mz_rt) %>%
+  ggplot(aes(x = rt)) +
+  geom_density() +
+  theme_minimal() +
+  labs(x = "Retention time",
+       y = "Number of features",
+       title = "Distribution of features by retention time")
+```
+
+
+## Missing data
+
+### Surveying missingness
+
+How many missing values are there for each feature?
+```{r fig.width=6, fig.height=3}
+# all data including QCs
+# how many missing values are there for each feature (row)
+na_by_feature <- rowSums(is.na(metab)) %>%
+  as.data.frame() %>%
+  rename(missing_values = 1)
+
+na_by_feature %>%
+  ggplot(aes(x = missing_values)) +
+  geom_histogram(bins = 116) + # since 116 samples
+  theme_minimal() + 
+  labs(title = "Number of missing values for each feature",
+       x = "Number of missing values",
+       y = "How many features have that \nmany missing values")
+```
+
+How many features have no missing values?
+```{r}
+na_by_feature %>%
+  count(missing_values == 0)
+```
+
+How many missing values are there for each sample?
+```{r fig.width=6, fig.height=3}
+# all data including QCs
+# how many missing values are there for each feature (row)
+na_by_sample <- colSums(is.na(metab)) %>%
+  as.data.frame() %>%
+  rename(missing_values = 1) %>%
+  rownames_to_column(var = "feature") %>%
+  filter(!feature == "mz_rt")
+
+na_by_sample %>%
+  ggplot(aes(x = missing_values)) +
+  geom_histogram(bins = 100) + # there are 3948 features
+  theme_minimal() + 
+  labs(title = "Number of missing values for each sample",
+       x = "Number of missing values",
+       y = "How many samples have that \nmany missing values")
+```
+
+Which features have a lot of missing values?
+```{r}
+contains_NAs_feature <- metab_long_meta %>%
+  group_by(mz_rt) %>%
+  count(is.na(rel_abund)) %>%
+  filter(`is.na(rel_abund)` == TRUE) %>%
+  arrange(desc(n))
+
+head(contains_NAs_feature)
+```
+
+Which samples have a lot of missing values?
+```{r}
+contains_NAs_sample <- metab_long_meta %>%
+  group_by(plot) %>%
+  count(is.na(rel_abund)) %>%
+  filter(`is.na(rel_abund)` == TRUE) %>%
+  arrange(desc(n))
+
+head(contains_NAs_sample)
+```
+
+
+Are there any missing values in the QCs? (There shouldn't be.)
+```{r}
+metab_QC <- metab %>%
+  dplyr::select(contains("QC"))
+
+na_by_sample <- colSums(is.na(metab_QC)) %>%
+  as.data.frame() %>%
+  rename(missing_values = 1) %>%
+  rownames_to_column(var = "feature") %>%
+  filter(!feature == "mz_rt")
+
+sum(na_by_sample$missing_values) # nope
+```
+
+### Imputing missing values
+This is an optional step but some downstream analyses don't handle missingness well. Here we are imputing missing data with half the lowest value observed for that feature.
+
+```{r}
+# grab only the feature data and leave metadata
+metab_wide_meta_imputed <- metab_wide_meta %>%
+  dplyr::select(-c(1:12)) 
+
+metab_wide_meta_imputed[] <- lapply(metab_wide_meta_imputed,
+                                 function(x) ifelse(is.na(x), min(x, na.rm = TRUE)/2, x))
+
+# bind back the metadata
+metab_wide_meta_imputed <- bind_cols(metab_wide_meta[,1:12], metab_wide_meta_imputed)
+
+# try working from original metab input file
+metab_imputed <- metab %>%
+  dplyr::select(-mz_rt)
+
+metab_imputed[] <- lapply(metab_imputed,
+                          function(x) ifelse(is.na(x), min(x, na.rm = TRUE)/2, x))
+
+# bind back metadata
+metab_imputed <- bind_cols (metab[,1], metab_imputed)
+```
+
+Did imputing work?
+```{r}
+metab_wide_meta_imputed %>%
+  dplyr::select(-c(1:11)) %>%
+  is.na() %>%
+  sum()
+```
+
+Create long imputed dataset.
+```{r}
+metab_long_meta_imputed <- metab_wide_meta_imputed %>%
+  pivot_longer(cols = 13:ncol(.),
+               names_to = "mz_rt",
+               values_to = "rel_abund")
+
+head(metab_long_meta_imputed)
+```
+
+Let's also make separate mz and rt columns.
+```{r}
+metab_long_meta_imputed <- metab_long_meta_imputed %>%
+  separate_wider_delim(cols = mz_rt,
+                       delim = "_",
+                       names = c("mz", "rt"),
+                       cols_remove = FALSE)
+
+metab_long_meta_imputed$mz <- as.numeric(metab_long_meta_imputed$mz)
+metab_long_meta_imputed$rt <- as.numeric(metab_long_meta_imputed$rt)
+```
+
+
+## Feature clustering with `notame`
+We want to cluster features that likely come from the same metabolite together, and we can do this using the package `notame`. You can learn more [here](http://127.0.0.1:24885/library/notame/doc/feature_clustering.html).
+
+```{r, eval = FALSE}
+browseVignettes("notame")
+```
+
+Let's make a m/z by retention time plot again before we start.
+```{r}
+(before_notame <- metab_long_meta_imputed %>%
+  group_by(mz_rt) %>% # so we only have one point per feature
+  ggplot(aes(x = rt, y = mz)) +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Retention time (min)",
+       y = "Mass to charge ratio (m/z)",
+       title = "m/z by retention time plot before notame",
+       subtitle = "C18 reverse phase, negative ionization mode"))
+```
+
+### Wrangling data
+
+Transpose the wide data for notame and wrangle to the right format. Below is info from the documentation: 
+
+* Data should be a data frame containing the abundances of features in each sample, one row per sample, each feature in a separate column
+* Features should be a data frame containing information about the features, namely feature name (should be the same as the column name in data), mass and retention time
+
+Going back to the original imported data and imputing from there seems kind of silly, but I had a lot of problems structuring this data to get find_connections() to run and not throw any errors because of names that weren't the same between the features and the data inputs.
+
+It is important that for the Data, your first sample is in row 2. The code below will get you there. If you're wondering why the code is written this way instead of just using metab_wide_meta_imputed, this is why.
+```{r}
+# # create a data frame which is just the original metab data
+# transposed so samples are rows and features are columns
+data_notame <- data.frame(metab_imputed %>%
+                          t())
+
+data_notame <- data_notame %>%
+  tibble::rownames_to_column() %>% # change samples from rownames to its own column
+  row_to_names(row_number = 1) # change the feature IDs (mz_rt) from first row obs into column names
+
+# change to results to numeric
+# it is important that the first row of data has the row number 2
+# i don't know why this is but save yourself all the time maria/jess spent figuring out
+# why this wasn't working
+data_notame <- data_notame %>%
+  mutate(across(-mz_rt, as.numeric))
+
+tibble(data_notame)
+```
+
+Create df with features.
+```{r}
+features <- metab_long_meta_imputed %>%
+  dplyr::select(mz_rt, mz, rt) %>%
+  mutate(across(c(mz, rt), as.numeric)) %>%
+  as.data.frame() %>%
+  distinct()
+
+glimpse(features)
+class(features)
+```
+
+### Find connections
+Set `cache = TRUE` for this chunk since its a bit slow especially if you have a lot of features. For ~4000 features takes ~12 min.
+```{r, cache = TRUE}
+connection <- find_connections(data = data_notame,
+                               features = features,
+                               corr_thresh = 0.9,
+                               rt_window = 1/60,
+                               name_col = "mz_rt",
+                               mz_col = "mz",
+                               rt_col = "rt")
+```
+
+```{r}
+head(connection)
+```
+
+### Clustering
+Now that we have found all of the features that are connected based on the parameterers we have set, we now need to find clusters.
+```{r}
+clusters <- find_clusters(connections = connection, 
+                          d_thresh = 0.8)
+```
+
+Assign a cluster ID to each feature to keep, and the feature that is picked is the one with the highest median peak intensity across the samples.
+```{r}
+# assign a cluster ID to all features
+# clusters are named after feature with highest median peak height
+features_clustered <- assign_cluster_id(data_notame, 
+                                        clusters, 
+                                        features, 
+                                        name_col = "mz_rt")
+```
+
+Export out a list of your clusters this way you can use this later during metabolite ID.
+```{r, eval = FALSE}
+# export clustered feature list this way you have it
+write_csv(features_clustered,
+          "data/features_notame-clusters-neg.csv")
+```
+
+Pull data out from the clusters and see how many features we removed/have now.
+```{r}
+# lets see how many features are removed when we only keep one feature per cluster
+pulled <- pull_clusters(data_notame, features_clustered, name_col = "mz_rt")
+
+cluster_data <- pulled$cdata
+cluster_features <- pulled$cfeatures
+
+# how many features did we originally have after filtering?
+nrow(metab_imputed)
+
+# how many features got removed during clustering?
+nrow(metab_imputed) - nrow(cluster_features)
+
+# what percentage of the original features were removed?
+((nrow(metab_imputed) - nrow(cluster_features))/nrow(metab_imputed)) * 100
+```
+
+Reduce our dataset to include only our new clusters. `cluster_data` contains only the retained clusters, while `cluster_features` tells you also which features are a part of each cluster.
+```{r}
+# combined metadata_plus with cluster_features
+cluster_data <- cluster_data %>%
+  rename(sample = mz_rt) # since this column is actually sample name
+
+# make a wide df
+metab_imputed_clustered_wide <- left_join(metadata_plus, cluster_data,
+                                          by = "sample") %>%
+  mutate(species = if_else(is.na(species), "QC", species))
+
+# make a long/tidy df
+metab_imputed_clustered_long <- metab_imputed_clustered_wide %>%
+  pivot_longer(cols = 13:ncol(.),
+               names_to = "mz_rt",
+               values_to = "rel_abund") %>%
+  separate_wider_delim(cols = mz_rt, # make separate columns for mz and rt too
+                       delim = "_",
+                       names = c("mz", "rt"),
+                       cols_remove = FALSE) %>%
+  mutate(across(.cols = c("mz", "rt"), .fns = as.numeric)) # make mz and rt numeric
+
+```
+
+Let's look at a m/z by retention time plot again after clustering.
+```{r}
+(after_notame <- metab_imputed_clustered_long %>%
+  group_by(mz_rt) %>% # so we only have one point per feature
+  ggplot(aes(x = rt, y = mz)) +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Retention time (min)",
+       y = "Mass to charge ratio (m/z)",
+       title = "m/z by retention time plot after notame",
+       subtitle = "C18 reverse phase, negative ionization mode"))
+```
+
+```{r, fig.width = 8, fig.height = 8}
+before_notame / after_notame
+```
+
+## Assessing data quality
+Let's make sure that our data is of good quality.
+
+### Untransformed data
+First we are going to convert the type of some of the columns to match what we want (e.g., run order converted to numeric, species to factor)
+```{r}
+tibble(metab_imputed_clustered_long)
+
+metab_imputed_clustered_long$run_order <- as.numeric(metab_imputed_clustered_long$run_order)
+metab_imputed_clustered_long$sample <- as.factor(metab_imputed_clustered_long$sample)
+metab_imputed_clustered_long$plot <- as.factor(metab_imputed_clustered_long$plot)
+metab_imputed_clustered_long$species <- as.factor(metab_imputed_clustered_long$species)
+
+# for species, NA is the QCs so let's change that coding
+metab_imputed_clustered_long <- metab_imputed_clustered_long %>%
+  mutate(species = if_else(is.na(species), "QC", species))
+
+# did it work?
+unique(metab_imputed_clustered_long$species)
+```
+
+Let's make a boxplot to see how the metabolite abundance looks across different samples.
+```{r}
+metab_imputed_clustered_long %>%
+  ggplot(aes(x = sample, y = rel_abund, fill = species)) +
+  geom_boxplot(alpha = 0.6) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "LC-MS (-) Feature Abundances by Sample",
+       subtitle = "Data is unscaled",
+       y = "Relative abundance")
+```
+
+Can't really see anything because data is skewed.
+
+### Transformed data
+#### Log2 transformed
+We will log2 transform our data.
+```{r}
+metab_imputed_clustered_long_log2 <- metab_imputed_clustered_long %>%
+  mutate(rel_abund = log2(rel_abund))
+```
+
+And then plot.
+```{r}
+metab_imputed_clustered_long_log2 %>%
+  ggplot(aes(x = sample, y = rel_abund, fill = species)) +
+  geom_boxplot(alpha = 0.6) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "LC-MS (-) Feature Abundances by Sample",
+       subtitle = "Data is log2 transformed",
+       y = "Relative abundance")
+```
+
+We can look at this data where we group by species. 
+```{r}
+metab_imputed_clustered_long_log2 %>%
+  mutate(sample = fct_reorder(sample, species)) %>%
+  ggplot(aes(x = sample , y = rel_abund, fill = species)) +
+  geom_boxplot(alpha = 0.6) +
+  scale_fill_brewer(palette = "Reds") + # red bc tomato
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "LC-MS (-) Feature Abundances by Sample",
+       subtitle = "Data is log2 transformed",
+       y = "Relative abundance")
+```
+
+We can also look at this data by run order to see if we have any overall run order effects visible.
+```{r}
+metab_imputed_clustered_long_log2 %>%
+  mutate(sample = fct_reorder(sample, run_order)) %>%
+  ggplot(aes(x = sample , y = rel_abund, fill = species)) +
+  geom_boxplot(alpha = 0.6) +
+  scale_fill_brewer(palette = "Reds") + # red bc tomato
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "LC-MS (-) Feature Abundances by Sample",
+       subtitle = "Data is log2 transformed",
+       y = "Relative abundance")
+```
+
+#### Log10 transformed
+We will log10 transform our data.
+```{r}
+metab_imputed_clustered_long_log10 <- metab_imputed_clustered_long %>%
+  mutate(rel_abund = log10(rel_abund))
+```
+
+We can look at this data where we group by species. 
+```{r}
+metab_imputed_clustered_long_log10 %>%
+  mutate(sample = fct_reorder(sample, species)) %>%
+  ggplot(aes(x = sample , y = rel_abund, fill = species)) +
+  geom_boxplot(alpha = 0.6) +
+  scale_fill_brewer(palette = "Reds") + # red bc tomato
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "LC-MS (-) Feature Abundances by Sample",
+       subtitle = "Data is log10 transformed",
+       y = "Relative abundance")
+```
+
+We can also look at this data by run order to see if we have any overall run order effects visible.
+```{r}
+metab_imputed_clustered_long_log10 %>%
+  mutate(sample = fct_reorder(sample, run_order)) %>%
+  ggplot(aes(x = sample , y = rel_abund, fill = species)) +
+  geom_boxplot(alpha = 0.6) +
+  scale_fill_brewer(palette = "Reds") + # red bc tomato
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "LC-MS (-) Feature Abundances by Sample",
+       subtitle = "Data is log10 transformed",
+       y = "Relative abundance")
+```
+
+#### Autoscaled
+Scales to unit variance, where the mean for each feature is 0 with a standard deviation of 1. This works well when all metabolites are considered to be equivalently important though measurement errors can be inflated. We've never actually scaled data this way for a project but whatever here it is.
+
+```{r}
+metab_imputed_clustered_wide <- metab_imputed_clustered_long %>%
+  select(-mz, -rt) %>%
+  pivot_wider(names_from = "mz_rt",
+              values_from = "rel_abund")
+
+# autoscaling on the now zero-centered matrix
+autoscaled <- 
+    bind_cols(metab_imputed_clustered_wide[1:12], # metadata
+            lapply(metab_imputed_clustered_wide[13:ncol(metab_imputed_clustered_wide)], # metab data
+                   scale)) # scale to mean 0 sd 1
+
+autoscaled[1:10,12:18]
+
+# did it work?
+mean(autoscaled$`215.035_0.6816`)
+sd(autoscaled$`215.035_0.6816`) # ya
+
+```
+
+```{r}
+autoscaled_long <- autoscaled %>%
+  pivot_longer(cols = 13:ncol(.),
+               names_to = "mz_rt",
+               values_to = "rel_abund") %>%
+  mutate(species = as.factor(species))
+
+autoscaled_long %>%
+  mutate(sample = fct_reorder(sample, run_order)) %>%
+  ggplot(aes(x = sample , y = rel_abund, fill = species)) +
+  geom_boxplot(alpha = 0.6) +
+  scale_fill_brewer(palette = "Reds") + # red bc tomato
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "LC-MS (-) Feature Abundances by Sample",
+       subtitle = "Data is autoscaled",
+       y = "Relative abundance")
+```
+
+This is weird I wouldn't want to use this.
+
+#### Pareto scaled
+Pareto scaling scales but keeps the fidelity of the original differences in absolute measurement value more than autoscaling. Often data is Pareto scaled after log transofmration
+
+```{r pareto scale}
+metab_wide_meta_imputed_log2 <- metab_imputed_clustered_long_log2 %>%
+  select(-mz, -rt) %>%
+  pivot_wider(names_from = "mz_rt",
+              values_from = "rel_abund")
+
+metab_imputed_clustered_wide_log2_metabs <- 
+  metab_wide_meta_imputed_log2[,13:ncol(metab_wide_meta_imputed_log2)]
+
+pareto_scaled <- 
+  IMIFA::pareto_scale(metab_imputed_clustered_wide_log2_metabs, center = FALSE)
+
+pareto_scaled <- bind_cols(metab_wide_meta_imputed_log2[,1:12], pareto_scaled)
+```
+
+```{r}
+pareto_scaled_long <- pareto_scaled %>%
+  pivot_longer(cols = 13:ncol(.),
+               names_to = "mz_rt",
+               values_to = "rel_abund")
+
+pareto_scaled_long %>%
+  mutate(sample = fct_reorder(sample, species)) %>%
+  ggplot(aes(x = sample , y = rel_abund, fill = species)) +
+  geom_boxplot(alpha = 0.6) +
+  scale_fill_brewer(palette = "Reds") + # red bc tomato
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "LC-MS (-) Feature Abundances by Sample",
+       subtitle = "Data is Pareto scaled",
+       y = "Relative abundance")
+```
+
+I am going to use log2 transformed data for the rest of this analysis.
+
+## PCAs
+### With QCs
+```{r}
+pca_qc <- prcomp(metab_wide_meta_imputed_log2[,-c(1:12)], # remove metadata
+                 scale = FALSE, # we did our own scaling
+                 center = TRUE) # true is the default
+
+summary(pca_qc)
+```
+
+Look at how much variance is explained by each PC.
+```{r}
+importance_qc <- summary(pca_qc)$importance %>%
+  as.data.frame()
+
+head(importance_qc)
+```
+
+Generate a scree plot.
+```{r}
+fviz_eig(pca_qc)
+```
+
+Generate a scores plot (points are samples) quickly with `fviz_pca_ind`.
+```{r}
+fviz_pca_ind(pca_qc)
+```
+
+Make a scores plot but prettier.
+```{r}
+# create a df of pca_qc$x
+scores_raw_qc <- as.data.frame(pca_qc$x)
+
+# bind meta-data
+scores_qc <- bind_cols(metab_wide_meta_imputed_log2[,1:12], # first 3 columns
+                    scores_raw_qc)
+```
+
+Plot.
+```{r}
+# create objects indicating percent variance explained by PC1 and PC2
+PC1_percent_qc <- round((importance_qc[2,1])*100, # index 2nd row, 1st column, times 100
+                         1) # round to 1 decimal
+PC2_percent_qc <- round((importance_qc[2,2])*100, 1) 
+
+# plot
+# aes(text) is for setting tooltip with plotly later to indicate hover text
+(scores_qc_plot <- scores_qc %>%
+  ggplot(aes(x = PC1, y = PC2, fill = species, text = glue("Sample: {sample},
+                                                           Species: {species}"))) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(shape = 21, color = "black") +
+  scale_fill_brewer(palette = "Reds") +
+  theme_minimal() +
+  labs(x = glue("PC1: {PC1_percent_qc}%"), 
+       y = glue("PC2: {PC2_percent_qc}%"), 
+       title = "PCA Scores Plot Colored by Species"))
+```
+
+Then make your scores plot ineractive so you can see who is who.
+```{r}
+ggplotly(scores_qc_plot, tooltip = "text")
+```
+
+
+Make a loadings plot (points are features) even though it might not be that useful.
+```{r}
+fviz_pca_var(pca_qc)
+```
+
+See what I mean? Not that useful. There are some functions in PCAtools that label only the points that most contribute to each PC. Could also do this manually if its of interest.
+
+### Without QCs
+```{r}
+metab_wide_meta_imputed_log2_noqc <- metab_wide_meta_imputed_log2 %>%
+  filter(!species == "QC")
+
+
+pca_noqc <- prcomp(metab_wide_meta_imputed_log2_noqc[,-c(1:12)], # remove metadata
+                 scale = FALSE, # we did our own scaling
+                 center = TRUE) # true is the default
+
+summary(pca_noqc)
+```
+
+Look at how much variance is explained by each PC.
+```{r}
+importance_noqc <- summary(pca_noqc)$importance %>%
+  as.data.frame()
+
+head(importance_noqc)
+```
+
+Generate a scree plot.
+```{r}
+fviz_eig(pca_noqc)
+```
+
+Generate a scores plot (points are samples) quickly with `fviz_pca_ind`.
+```{r}
+fviz_pca_ind(pca_noqc)
+```
+
+Make a scores plot but prettier.
+```{r}
+# create a df of pca_qc$x
+scores_raw_noqc <- as.data.frame(pca_noqc$x)
+
+# bind meta-data
+scores_noqc <- bind_cols(metab_wide_meta_imputed_log2_noqc[,1:12], # first 3 columns
+                         scores_raw_noqc)
+```
+
+Plot.
+```{r}
+# create objects indicating percent variance explained by PC1 and PC2
+PC1_percent_noqc <- round((importance_noqc[2,1])*100, # index 2nd row, 1st column, times 100
+                         1) # round to 1 decimal
+PC2_percent_noqc <- round((importance_noqc[2,2])*100, 1) 
+
+# plot
+# aes(text) is for setting tooltip with plotly later to indicate hover text
+(scores_noqc_plot <- scores_noqc %>%
+  ggplot(aes(x = PC1, y = PC2, fill = species, text = glue("Sample: {sample},
+                                                           Species: {species}"))) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(shape = 21, color = "black") +
+  scale_fill_brewer(palette = "Reds") +
+  theme_minimal() +
+  labs(x = glue("PC1: {PC1_percent_noqc}%"), 
+       y = glue("PC2: {PC2_percent_noqc}%"), 
+       title = "PCA Scores Plot Colored by Species"))
+```
+
+Then make your scores plot ineractive so you can see who is who.
+```{r}
+ggplotly(scores_noqc_plot, tooltip = "text")
+```
+
+
+Make a loadings plot (points are features) even though it might not be that useful.
+```{r}
+fviz_pca_var(pca_noqc)
+```
+
+See what I mean? Not that useful. There are some functions in PCAtools that label only the points that most contribute to each PC. Could also do this manually if its of interest.
+
+
+## Univariate Testing
+I am going to include some sample univariate testing for comparisons between two and more than two groups.
+
+Here we are going to compare the metabolite differences between accessions that have been reported to be bitter, and those that haven't. We will do unpaired t-tests and use a multiple testing correction. This isn't really a good dataset to ask this question but we are going to do it for demonstrative purposes. 
+
+```{r}
+# run series of t-tests
+bitter_or_not <- metab_imputed_clustered_long_log2 %>%
+  filter(bitter == "YES" | bitter == "NO") %>%
+  dplyr::select(sample, bitter, mz_rt, rel_abund) %>%
+  group_by(mz_rt) %>%
+  t_test(rel_abund ~ bitter, 
+         paired = FALSE, 
+         detailed = TRUE, # gives you more detail in output
+         p.adjust.method = "BH") %>% # Benjamini-Hochberg false discovery rate multiple testing correction
+  add_significance()
+
+# extract out only the significantly different features
+bitter_or_not_sig <- bitter_or_not %>%
+  filter(p <= 0.05)
+
+nrow(bitter_or_not_sig)
+```
+
+What features are significantly different among the different species? This isn't really a good dataset to ask this question but we are going to do it for demonstrative purposes. 
+```{r}
+# run series of t-tests
+species_diff <- metab_imputed_clustered_long_log2 %>%
+  drop_na(species) %>% # drop NA for species which are the QCs
+  dplyr::select(sample, species, mz_rt, rel_abund) %>%
+  group_by(mz_rt) %>%
+  anova_test(rel_abund ~ species, 
+             detailed = TRUE) %>% # gives you more detail in output
+#             p.adjust.method = "BH") %>% # Benjamini-Hochberg false discovery rate multiple testing correction
+  add_significance() %>%
+  as.data.frame()
+
+# extract out only the significantly different features
+species_diff_sig <- species_diff %>%
+  filter(p <= 0.05)
+
+nrow(species_diff_sig)
+```
+

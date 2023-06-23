@@ -1,7 +1,6 @@
 ---
 title: "Filtering for Untargeted Metabolomics Data"
 author: "The Cooperstone lab"
-date: "Lots of times"
 output:
   github_document:
     toc: true
@@ -19,7 +18,7 @@ Below is a series of code put together by the Cooperstone lab (Emma Bilbrey, Jen
 
 ```{r, message = FALSE}
 library(tidyverse)
-library(janitor) # if you want to clean_names()
+library(janitor) # if you want to clean_names() or get_dupes()
 ```
 
 Once you get deconvoluted data from MZmine or similar programs, you need to wrangle your data in such a way that you can conduct your analysis on it.
@@ -58,7 +57,7 @@ This creates a unique identifier for each feature using its mass-to-charge ratio
 ```{r}
 MZ_RT <- metabdata_RTfilt %>%
   mutate(mz = round(metabdata_RTfilt$`row m/z`, digits = 4), # Decrease number of decimals for m/z & rt
-         rt = round(metabdata_RTfilt$`row retention time`, digits = 3),
+         rt = round(metabdata_RTfilt$`row retention time`, digits = 4),
          .before=1,
          .keep="unused") %>%
   unite(mz_rt, c(mz, rt), remove=TRUE) #%>% # Combine m/z & rt with _ in between
@@ -211,10 +210,34 @@ MZ_RT_filt_PBremoved <- MZ_RT_filt_PB %>%
 dim(MZ_RT_filt_PBremoved)
 ```
 
+Do we have any duplicate features?
+```{r}
+get_dupes(MZ_RT_filt_PBremoved, mz_rt)
+```
+
+Yes, let's remove them.
+```{r}
+MZ_RT_filt_PBremoved_nodupes <- MZ_RT_filt_PBremoved %>%
+  rownames_to_column(var = "row_number")
+
+# find the row numbers with the duplicates
+get_dupes(MZ_RT_filt_PBremoved_nodupes, mz_rt)
+
+MZ_RT_filt_PBremoved_nodupes <- MZ_RT_filt_PBremoved_nodupes %>%
+  filter(!row_number %in% c(3785, 3459, 3887)) # remove one of the dupes for each feature
+
+dim(MZ_RT_filt_PBremoved_nodupes)  
+
+# get rid of row_number
+MZ_RT_filt_PBremoved_nodupes <- MZ_RT_filt_PBremoved_nodupes %>%
+  select(-row_number)
+```
+
+
 ## Save your file
 Now you have a list of features present in your samples after filtering for CV in QCs, and removing all the extraneous columns we added to help us do this, along with removing any process blanks.
 ```{r, eval = FALSE}
-write_csv(MZ_RT_filt_PBremoved,
+write_csv(MZ_RT_filt_PBremoved_nodupes,
           "data/BNB_neg_filtered_template.csv")
 ```
 

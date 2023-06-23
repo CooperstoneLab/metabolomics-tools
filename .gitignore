@@ -37,3 +37,9 @@ vignettes/*.pdf
 
 # R Environment Variables
 .Renviron
+
+# Other
+maria/
+Metabolomics-filtering.template_github.Rmd
+Metabolomics-data-analysis-template_cache/
+Metabolomics-data-analysis-template_files/
